@@ -47,14 +47,23 @@ void applyChannelLayout(AudioFormat& format, int channels)
 
     AudioFormat::ChannelLayout layout;
     switch(channels) {
+        case 1:
+            layout = {Pos::FrontCenter};
+            break;
         case 2:
             layout = {Pos::FrontLeft, Pos::FrontRight};
             break;
+        case 3:
+            layout = {Pos::FrontLeft, Pos::FrontRight, Pos::FrontCenter};
+            break;
+        case 4:
+            layout = {Pos::FrontLeft, Pos::FrontRight, Pos::BackLeft, Pos::BackRight};
+            break;
         case 5:
-            layout = {Pos::FrontLeft, Pos::FrontRight, Pos::FrontCenter, Pos::SideLeft, Pos::SideRight};
+            layout = {Pos::FrontLeft, Pos::FrontRight, Pos::FrontCenter, Pos::BackLeft, Pos::BackRight};
             break;
         case 6:
-            layout = {Pos::FrontLeft, Pos::FrontRight, Pos::FrontCenter, Pos::LFE, Pos::SideLeft, Pos::SideRight};
+            layout = {Pos::FrontLeft, Pos::FrontRight, Pos::FrontCenter, Pos::LFE, Pos::BackLeft, Pos::BackRight};
             break;
         default:
             break;
@@ -588,7 +597,32 @@ bool SacdDecoder::produce()
         return false;
     }
 
-    auto flushResampler = [this]() {
+    auto appendSamples = [this](const float* data, size_t frameCount) -> bool {
+        size_t first = 0;
+        if(m_skipOutFrames > 0) {
+            const auto skip = std::min<uint64_t>(m_skipOutFrames, static_cast<uint64_t>(frameCount));
+            first           = static_cast<size_t>(skip) * static_cast<size_t>(m_channels);
+            m_skipOutFrames -= skip;
+        }
+
+        const size_t total = frameCount * static_cast<size_t>(m_channels);
+        if(first >= total) {
+            return false;
+        }
+
+        const size_t oldSize = m_pending.size();
+        m_pending.insert(m_pending.end(), data + first, data + total);
+
+        if(m_gain != 1.0F) {
+            for(size_t i = oldSize; i < m_pending.size(); ++i) {
+                m_pending[i] *= m_gain;
+            }
+        }
+
+        return true;
+    };
+
+    auto flushResampler = [this, &appendSamples]() {
         if(!m_swr || m_flushedResampler) {
             return;
         }
@@ -599,8 +633,7 @@ bool SacdDecoder::produce()
         auto* outPtr = reinterpret_cast<uint8_t*>(tail.data());
         const int n  = swr_convert(m_swr, &outPtr, capacity, nullptr, 0);
         if(n > 0) {
-            m_pending.insert(m_pending.end(), tail.begin(),
-                             tail.begin() + static_cast<std::ptrdiff_t>(n) * m_channels);
+            appendSamples(tail.data(), static_cast<size_t>(n));
         }
     };
 
@@ -653,24 +686,8 @@ bool SacdDecoder::produce()
             sampleFrames = n;
         }
 
-        size_t first = 0;
-        if(m_skipOutFrames > 0) {
-            const auto skip = std::min<uint64_t>(m_skipOutFrames, static_cast<uint64_t>(sampleFrames));
-            first           = static_cast<size_t>(skip) * static_cast<size_t>(m_channels);
-            m_skipOutFrames -= skip;
-        }
-
-        if(first >= samples->size()) {
+        if(!appendSamples(samples->data(), static_cast<size_t>(sampleFrames))) {
             continue;
-        }
-
-        const size_t oldSize = m_pending.size();
-        m_pending.insert(m_pending.end(), samples->begin() + static_cast<std::ptrdiff_t>(first), samples->end());
-
-        if(m_gain != 1.0F) {
-            for(size_t i = oldSize; i < m_pending.size(); ++i) {
-                m_pending[i] *= m_gain;
-            }
         }
 
         return true;
