@@ -13,9 +13,13 @@ if [ -z "${FOOYIN_VERSION:-}" ]; then
   if command -v dpkg-query >/dev/null 2>&1 && dpkg-query -W fooyin >/dev/null 2>&1; then
     FOOYIN_VERSION="$(dpkg-query -W -f='${Version}' fooyin | sed 's/^[0-9]*://; s/^\([0-9][0-9.]*\).*/\1/')"
   elif command -v rpm >/dev/null 2>&1 && rpm -q fooyin >/dev/null 2>&1; then
-    FOOYIN_VERSION="$(rpm -q --qf '%{VERSION}' fooyin)"
+    FOOYIN_VERSION="$(rpm -q --qf '%{VERSION}' fooyin | sed 's/^[0-9]*://; s/^\([0-9][0-9.]*\).*/\1/')"
   elif command -v pacman >/dev/null 2>&1 && pacman -Q fooyin >/dev/null 2>&1; then
     FOOYIN_VERSION="$(pacman -Q fooyin | sed 's/^fooyin //; s/^[0-9]*://; s/^\([0-9][0-9.]*\).*/\1/')"
+  elif command -v pacman >/dev/null 2>&1 && pacman -Q fooyin-git >/dev/null 2>&1; then
+    echo "Detected fooyin-git; its plugin ABI may not match a release tag."
+    echo "Build against the matching fooyin source tree, or set FOOYIN_VERSION=x.y.z explicitly."
+    exit 1
   elif command -v fooyin >/dev/null 2>&1; then
     FOOYIN_VERSION="$(fooyin --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
   fi
@@ -37,8 +41,10 @@ fi
 rm -rf fooyin/src/plugins/sacdiso
 cp -r "$REPO_DIR/plugin" fooyin/src/plugins/sacdiso
 if ! grep -q sacdiso fooyin/src/plugins/CMakeLists.txt; then
-  sed -i 's/^\(\s*\)sndfile$/\1sndfile\n\1sacdiso/' fooyin/src/plugins/CMakeLists.txt
+  sed -i 's/^\([[:space:]]*\)sndfile$/\1sndfile\n\1sacdiso/' fooyin/src/plugins/CMakeLists.txt
   sed -i 's/^fooyin_add_selected_plugin(sndfile)/&\nfooyin_add_selected_plugin(sacdiso)/' fooyin/src/plugins/CMakeLists.txt
+  grep -q sacdiso fooyin/src/plugins/CMakeLists.txt \
+    || { echo "Failed to register sacdiso in fooyin/src/plugins/CMakeLists.txt"; exit 1; }
 fi
 
 cmake -G Ninja -S fooyin -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
