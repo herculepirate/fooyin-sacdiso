@@ -10,22 +10,24 @@ WORK="${SACDISO_WORK:-$HOME/.cache/fooyin-sacdiso-build}"
 DEST="$HOME/.var/app/$APP/.local/lib/fooyin/plugins"
 
 command -v flatpak >/dev/null || { echo "flatpak not found"; exit 1; }
-flatpak info "$APP" >/dev/null 2>&1 || { echo "$APP is not installed"; exit 1; }
+LC_ALL=C flatpak info "$APP" >/dev/null 2>&1 || { echo "$APP is not installed"; exit 1; }
 
-VERSION="$(flatpak info "$APP" | awk '/Version:/ {print $2; exit}')"
+VERSION="$(LC_ALL=C flatpak info "$APP" | awk '/Version:/ {print $2; exit}')"
 # The runtime the app runs on, e.g. org.kde.Platform/x86_64/6.9. (`flatpak info -r`
 # prints the app's own ref, app/org.fooyin.fooyin/x86_64/stable, which is not it.)
-RUNTIME="$(flatpak info --show-runtime "$APP")"
+RUNTIME="$(LC_ALL=C flatpak info --show-runtime "$APP")"
+[ -n "$VERSION" ] || { echo "Could not detect the installed fooyin version from flatpak info"; exit 1; }
+[ -n "$RUNTIME" ] || { echo "Could not detect the Flatpak runtime for $APP"; exit 1; }
 ARCH="$(echo "$RUNTIME" | cut -d/ -f2)"
 BRANCH="${RUNTIME##*/}"
 SDK="org.kde.Sdk/$ARCH/$BRANCH"
 # Install the SDK where fooyin itself is installed (system or user), so flatpak
 # does not stop to ask when both installations have a flathub remote.
-WHERE="$(flatpak list --app --columns=application,installation | awk -v a="$APP" '$1 == a {print $2; exit}')"
+WHERE="$(LC_ALL=C flatpak list --app --columns=application,installation | awk -v a="$APP" '$1 == a {print $2; exit}')"
 case "$WHERE" in system) WHERE=--system ;; *) WHERE=--user ;; esac
 echo "fooyin $VERSION, runtime $RUNTIME -> $SDK ($WHERE)"
 
-if ! flatpak info "$SDK" >/dev/null 2>&1; then
+if ! LC_ALL=C flatpak info "$SDK" >/dev/null 2>&1; then
   flatpak install "$WHERE" -y --noninteractive flathub "$SDK" \
     || { echo "Could not install $SDK from flathub"; exit 1; }
 fi
@@ -40,16 +42,18 @@ fi
 rm -rf fooyin/src/plugins/sacdiso
 cp -r "$REPO_DIR/plugin" fooyin/src/plugins/sacdiso
 if ! grep -q sacdiso fooyin/src/plugins/CMakeLists.txt; then
-  sed -i 's/^\(\s*\)sndfile$/\1sndfile\n\1sacdiso/' fooyin/src/plugins/CMakeLists.txt
+  sed -i 's/^\([[:space:]]*\)sndfile$/\1sndfile\n\1sacdiso/' fooyin/src/plugins/CMakeLists.txt
   sed -i 's/^fooyin_add_selected_plugin(sndfile)/&\nfooyin_add_selected_plugin(sacdiso)/' fooyin/src/plugins/CMakeLists.txt
+  grep -q sacdiso fooyin/src/plugins/CMakeLists.txt \
+    || { echo "Failed to register sacdiso in fooyin/src/plugins/CMakeLists.txt"; exit 1; }
 fi
 
-flatpak run --command=sh --share=network --filesystem="$WORK" "$SDK" -c "
+flatpak run --command=sh --share=network --filesystem="$WORK" "$SDK" -c '
   set -e
-  cd '$WORK'
+  cd "$1"
   cmake -G Ninja -S fooyin -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
   ninja -C build sacdiso
-"
+' _ "$WORK"
 
 SO="$(find "$WORK/build" -name fyplugin_sacdiso.so | head -1)"
 [ -n "$SO" ] || { echo "build produced no plugin"; exit 1; }
