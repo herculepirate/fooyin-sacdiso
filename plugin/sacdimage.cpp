@@ -22,6 +22,7 @@
 #include <QStringDecoder>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 
 Q_LOGGING_CATEGORY(SACD_IMG, "fy.sacdiso")
@@ -41,6 +42,17 @@ constexpr const char* const GenreNames[] = {
     "Sound Effects", "Sound Track",  "Spoken Word",        "World Music",      "Blues",
 };
 constexpr int GenreCount = static_cast<int>(sizeof(GenreNames) / sizeof(GenreNames[0]));
+
+constexpr std::array<const char*, 10> AreaSectionSignatures = {
+    "SACDTTxt", "SACD_IGL", "SACD_ACC", "SACDTRL1", "SACDTRL2",
+    "SACD_Ind", "SACD_Man", "SACD_WLL", "SACDPLAY", "SACDRTOC",
+};
+
+bool isAreaSectionSignature(const uint8_t* sector)
+{
+    return std::any_of(AreaSectionSignatures.begin(), AreaSectionSignatures.end(),
+                       [sector](const char* sig) { return std::memcmp(sector, sig, 8) == 0; });
+}
 
 uint16_t be16(const uint8_t* p)
 {
@@ -184,17 +196,28 @@ AreaToc parseAreaToc(const QByteArray& data)
     int sector    = 1;
     while(sector < tocSectors) {
         const uint8_t* p = base + static_cast<size_t>(sector) * SacdSectorSize;
-        const uint8_t* sectorEnd = p + SacdSectorSize;
 
         if(std::memcmp(p, "SACDTTxt", 8) == 0) {
+            int nextSector = sector + 1;
+            while(nextSector < tocSectors) {
+                const uint8_t* next = base + static_cast<size_t>(nextSector) * SacdSectorSize;
+                if(isAreaSectionSignature(next)) {
+                    break;
+                }
+                ++nextSector;
+            }
+
+            const uint8_t* textEnd = base + static_cast<size_t>(nextSector) * SacdSectorSize;
+            const size_t textSize  = static_cast<size_t>(textEnd - p);
+
             if(textIndex == 0) {
                 for(int i = 0; i < trackCount; ++i) {
                     const size_t posOffset = 8 + static_cast<size_t>(i) * 2;
-                    if(posOffset + 2 > SacdSectorSize) {
+                    if(posOffset + 2 > textSize) {
                         break;
                     }
                     const uint16_t pos = be16(p + posOffset);
-                    if(pos == 0 || pos >= SacdSectorSize) {
+                    if(pos == 0 || static_cast<size_t>(pos) + 4 > textSize) {
                         continue;
                     }
 
@@ -204,12 +227,12 @@ AreaToc parseAreaToc(const QByteArray& data)
 
                     auto& track = area.tracks[static_cast<size_t>(i)];
 
-                    for(int j = 0; j < amount && t + 2 < sectorEnd; ++j) {
+                    for(int j = 0; j < amount && (textEnd - t) > 2; ++j) {
                         const uint8_t type = *t;
                         t += 2; // type + unknown byte
 
-                        if(t < sectorEnd && *t != 0) {
-                            const QString text = decodeText(t, sectorEnd, charset);
+                        if(t < textEnd && *t != 0) {
+                            const QString text = decodeText(t, textEnd, charset);
                             switch(type) {
                                 case 0x01:
                                     track.title = text;
@@ -238,10 +261,10 @@ AreaToc parseAreaToc(const QByteArray& data)
                         }
 
                         if(j < amount - 1) {
-                            while(t < sectorEnd && *t != 0) {
+                            while(t < textEnd && *t != 0) {
                                 ++t;
                             }
-                            while(t < sectorEnd && *t == 0) {
+                            while(t < textEnd && *t == 0) {
                                 ++t;
                             }
                         }
@@ -249,7 +272,7 @@ AreaToc parseAreaToc(const QByteArray& data)
                 }
             }
             ++textIndex;
-            sector += 1;
+            sector = nextSector;
         }
         else if(std::memcmp(p, "SACD_IGL", 8) == 0) {
             for(int i = 0; i < trackCount && i < 255; ++i) {

@@ -203,6 +203,31 @@ def build_master_toc(area1_toc, area1_toc2, area1_size, area2_toc, area2_toc2, a
 
 DST_MODE = False
 TEXT_GAP = 0
+MULTISECTOR_TEXT = False
+SECOND_TEXT_CHANNEL = False
+OOB_TEXT_OFFSET = False
+
+
+def write_track_text(t, start_sector, titles, performers, multisector, oob_offset=False):
+    sectors_used = 3 if multisector else 1
+    base = SECTOR * start_sector
+    block_size = SECTOR * sectors_used
+    t[base:base + 8] = b"SACDTTxt"
+    pos = 0x1000 if multisector else (8 + 2 * len(titles) + 8)
+    for i, (title, perf) in enumerate(zip(titles, performers)):
+        if oob_offset and i == len(titles) - 1:
+            # Test both near-end (pos + 4 > textSize) and far-past-end (0xFFFE) offsets.
+            oob_pos = (block_size - 2) if len(titles) > 1 else 0xFFFE
+            struct.pack_into(">H", t, base + 8 + 2 * i, oob_pos)
+            continue
+        struct.pack_into(">H", t, base + 8 + 2 * i, pos)
+        blob = bytearray()
+        blob += bytes([2, 0, 0, 0])
+        blob += bytes([0x01, 0x20]) + title.encode("latin-1") + b"\x00"
+        blob += bytes([0x02, 0x20]) + perf.encode("latin-1") + b"\x00"
+        t[base + pos:base + pos + len(blob)] = blob
+        pos += len(blob) + 2
+    return sectors_used
 
 
 def build_area_toc(ident, channels, loudspeaker, area_start, area_end, tracks, size_sectors, titles, performers):
@@ -221,35 +246,40 @@ def build_area_toc(ident, channels, loudspeaker, area_start, area_end, tracks, s
     t[69] = len(tracks)
     struct.pack_into(">I", t, 72, area_start)
     struct.pack_into(">I", t, 76, area_end)
-    t[80] = 1  # text area count
+    t[80] = 2 if SECOND_TEXT_CHANNEL else 1  # text area count
     t[88:90] = b"en"
     t[90] = 2
+    if SECOND_TEXT_CHANNEL:
+        t[92:94] = b"de"
+        t[94] = 2
     struct.pack_into(">H", t, 144, 152)
     t[152:152 + 12] = b"Test area ST"[:12]
-    # sector 1 (+gap): SACDTTxt
-    base = SECTOR * (1 + TEXT_GAP)
-    t[base:base + 8] = b"SACDTTxt"
-    pos = 8 + 2 * 255 if False else 8 + 2 * len(tracks) + 8
-    for i, (title, perf) in enumerate(zip(titles, performers)):
-        struct.pack_into(">H", t, base + 8 + 2 * i, pos)
-        blob = bytearray()
-        blob += bytes([2, 0, 0, 0])
-        blob += bytes([0x01, 0x20]) + title.encode("latin-1") + b"\x00"
-        blob += bytes([0x02, 0x20]) + perf.encode("latin-1") + b"\x00"
-        t[base + pos:base + pos + len(blob)] = blob
-        pos += len(blob) + 2
-    # sector 2 (+gap): SACDTRL1
-    base = SECTOR * (2 + TEXT_GAP)
+
+    cur_sector = 1 + TEXT_GAP
+    struct.pack_into(">H", t, 128, cur_sector)
+    cur_sector += write_track_text(t, cur_sector, titles, performers, MULTISECTOR_TEXT, OOB_TEXT_OFFSET)
+    if SECOND_TEXT_CHANNEL:
+        alt_titles = [f"Alt {title}" for title in titles]
+        alt_performers = [f"Alt {perf}" for perf in performers]
+        cur_sector += write_track_text(t, cur_sector, alt_titles, alt_performers, MULTISECTOR_TEXT, False)
+
+    # SACDTRL1
+    base = SECTOR * cur_sector
     t[base:base + 8] = b"SACDTRL1"
     for i, tr in enumerate(tracks):
         struct.pack_into(">I", t, base + 8 + 4 * i, tr["start_lsn"])
         struct.pack_into(">I", t, base + 8 + 255 * 4 + 4 * i, tr["length_lsn"])
-    # sector 3 (+gap): SACDTRL2
-    base = SECTOR * (3 + TEXT_GAP)
+    cur_sector += 1
+
+    # SACDTRL2
+    base = SECTOR * cur_sector
     t[base:base + 8] = b"SACDTRL2"
     for i, tr in enumerate(tracks):
         t[base + 8 + 4 * i:base + 8 + 4 * i + 4] = tc_with_flags(tr["start_frame"])
         t[base + 8 + 255 * 4 + 4 * i:base + 8 + 255 * 4 + 4 * i + 4] = tc_with_flags(tr["dur_frames"])
+    cur_sector += 1
+
+    assert cur_sector == size_sectors, (cur_sector, size_sectors)
     return bytes(t)
 
 
@@ -259,21 +289,31 @@ def main():
     ap.add_argument("--no-multi", action="store_true")
     ap.add_argument("--dst-raw", action="store_true", help="DST sector layout with uncompressed (DstCoded=0) frames")
     ap.add_argument("--text-gap", action="store_true", help="put an unused (zero) sector before the text sector in each area TOC")
+    ap.add_argument("--multisector-text", action="store_true", help="place SACDTTxt records at 0x1000 after a zero padding sector")
+    ap.add_argument("--second-text-channel", action="store_true", help="append a second consecutive SACDTTxt language channel")
+    ap.add_argument("--oob-text-offset", action="store_true", help="write out-of-bounds SACDTTxt pointer for the last track in each area")
     ap.add_argument("--seconds-per-track", type=float, default=0.6)
     args = ap.parse_args()
-    global DST_MODE, TEXT_GAP
+    global DST_MODE, TEXT_GAP, MULTISECTOR_TEXT, SECOND_TEXT_CHANNEL, OOB_TEXT_OFFSET
     DST_MODE = args.dst_raw
     TEXT_GAP = 1 if args.text_gap else 0
+    MULTISECTOR_TEXT = args.multisector_text
+    SECOND_TEXT_CHANNEL = args.second_text_channel
+    OOB_TEXT_OFFSET = args.oob_text_offset
 
     per_track = max(4, int(round(args.seconds_per_track * FRAME_RATE)))
     pregap = 2
 
+    tt_sectors = 3 if MULTISECTOR_TEXT else 1
+    tt_channels = 2 if SECOND_TEXT_CHANNEL else 1
+    area_toc_size = 1 + TEXT_GAP + tt_sectors * tt_channels + 2
+
     AREA1_TOC1 = 540
     AREA1_TOC2 = 560
-    AREA1_SIZE = 4 + TEXT_GAP
+    AREA1_SIZE = area_toc_size
     AREA2_TOC1 = 580
     AREA2_TOC2 = 600
-    AREA2_SIZE = 4 + TEXT_GAP
+    AREA2_SIZE = area_toc_size
     AREA1_START = 700
 
     print("generating stereo audio...", file=sys.stderr)
