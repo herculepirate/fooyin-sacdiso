@@ -2,7 +2,9 @@
 #include <QCoreApplication>
 #include <QFile>
 #include <QDebug>
+#include <QStringList>
 #include <cmath>
+#include <cstring>
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
@@ -10,27 +12,83 @@ extern "C" {
 using namespace Fooyin::SacdIso;
 
 static double goertzel(const std::vector<float>& x, int ch, int channels, double freq, double rate, size_t skip) {
+    const auto uChannels = static_cast<size_t>(channels);
+    const auto uCh = static_cast<size_t>(ch);
     double w = 2 * M_PI * freq / rate, c = 2 * std::cos(w), s1 = 0, s2 = 0;
-    size_t n = x.size() / channels;
+    size_t n = x.size() / uChannels;
     size_t cnt = 0;
-    for (size_t i = skip; i < n; ++i) { double v = x[i * channels + ch]; double s0 = v + c * s1 - s2; s2 = s1; s1 = s0; ++cnt; }
+    for (size_t i = skip; i < n; ++i) { double v = x[i * uChannels + uCh]; double s0 = v + c * s1 - s2; s2 = s1; s1 = s0; ++cnt; }
     double p = s1 * s1 + s2 * s2 - c * s1 * s2;
-    return std::sqrt(p) * 2.0 / cnt;
+    return std::sqrt(p) * 2.0 / static_cast<double>(cnt);
 }
 
 int main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
-    QFile f(argv[1]);
+
+    QString isoPath;
+    bool metadataOnly = false;
+    QStringList expectedTitles;
+    QStringList expectedPerformers;
+
+    for (int i = 1; i < argc; ++i) {
+        const QString arg = QString::fromLocal8Bit(argv[i]);
+        if (arg == QLatin1String("--metadata-only")) {
+            metadataOnly = true;
+        } else if (arg == QLatin1String("--expect-title") && i + 1 < argc) {
+            expectedTitles.push_back(QString::fromLocal8Bit(argv[++i]));
+        } else if (arg == QLatin1String("--expect-performer") && i + 1 < argc) {
+            expectedPerformers.push_back(QString::fromLocal8Bit(argv[++i]));
+        } else if (!arg.startsWith(QLatin1String("--")) && isoPath.isEmpty()) {
+            isoPath = arg;
+        } else {
+            qWarning() << "Unknown or incomplete option:" << arg;
+            return 1;
+        }
+    }
+
+    if (isoPath.isEmpty()) {
+        qWarning() << "Usage: test_sacd_core <iso> [--metadata-only] [--expect-title <title>]... [--expect-performer <performer>]...";
+        return 1;
+    }
+
+    QFile f(isoPath);
     if (!f.open(QIODevice::ReadOnly)) { qWarning() << "open fail"; return 1; }
     qInfo() << "isSacd" << isSacdImage(&f);
     SacdDisc disc; QString err;
     if (!readSacdDisc(&f, disc, &err)) { qWarning() << "read fail" << err; return 1; }
     qInfo() << "album" << disc.albumTitle << disc.albumArtist << disc.year << disc.month << disc.day << disc.genres << disc.albumCatalog;
+
+    int errors = 0;
+    qsizetype trackIndex = 0;
     for (auto& a : disc.areas) {
         qInfo() << "area multich" << a.multichannel << "ch" << a.channelCount << "fmt" << int(a.frameFormat) << "start" << a.areaStartLsn << "end" << a.areaEndLsn << a.description << "tracks" << a.tracks.size();
-        for (auto& t : a.tracks) qInfo() << "  track" << t.number << t.title << t.performer << "lsn" << t.startLsn << t.lengthLsn << "tc" << t.startFrame << t.durationFrames << "ms" << t.durationMs();
+        for (auto& t : a.tracks) {
+            qInfo() << "  track" << t.number << t.title << t.performer << "lsn" << t.startLsn << t.lengthLsn << "tc" << t.startFrame << t.durationFrames << "ms" << t.durationMs();
+            if (!expectedTitles.isEmpty() && trackIndex < expectedTitles.size() && t.title != expectedTitles[trackIndex]) {
+                qWarning() << "  FAIL title mismatch at track index" << trackIndex << "expected" << expectedTitles[trackIndex] << "got" << t.title;
+                ++errors;
+            }
+            if (!expectedPerformers.isEmpty() && trackIndex < expectedPerformers.size() && t.performer != expectedPerformers[trackIndex]) {
+                qWarning() << "  FAIL performer mismatch at track index" << trackIndex << "expected" << expectedPerformers[trackIndex] << "got" << t.performer;
+                ++errors;
+            }
+            ++trackIndex;
+        }
     }
-    int errors = 0;
+
+    if (!expectedTitles.isEmpty() && trackIndex != expectedTitles.size()) {
+        qWarning() << "FAIL expected" << expectedTitles.size() << "title(s) but found" << trackIndex << "track(s)";
+        ++errors;
+    }
+    if (!expectedPerformers.isEmpty() && trackIndex != expectedPerformers.size()) {
+        qWarning() << "FAIL expected" << expectedPerformers.size() << "performer(s) but found" << trackIndex << "track(s)";
+        ++errors;
+    }
+
+    if (metadataOnly) {
+        return errors;
+    }
+
     for (auto& a : disc.areas) {
         for (auto& t : a.tracks) {
             SacdFrameReader rd(&f, a.channelCount);
@@ -45,14 +103,18 @@ int main(int argc, char** argv) {
             while (rd.next(fr)) {
                 if (fr.timecode < (t.hasTimes ? t.startFrame : 0)) continue;
                 if (t.hasTimes && fr.timecode >= t.startFrame + t.durationFrames) break;
-                if (n == 0) first = fr.timecode; last = fr.timecode; ++n;
-                av_new_packet(pkt, fr.data.size()); memcpy(pkt->data, fr.data.constData(), fr.data.size());
+                if (n == 0) first = fr.timecode;
+                last = fr.timecode;
+                ++n;
+                av_packet_unref(pkt);
+                av_new_packet(pkt, static_cast<int>(fr.data.size()));
+                std::memcpy(pkt->data, fr.data.constData(), static_cast<size_t>(fr.data.size()));
                 avcodec_send_packet(ctx, pkt); av_frame_unref(av);
                 if (avcodec_receive_frame(ctx, av) < 0) { qWarning() << "decode fail"; continue; }
-                for (int i = 0; i < av->nb_samples; ++i) for (int c = 0; c < a.channelCount; ++c) pcm.push_back(((float*)av->extended_data[c])[i]);
+                for (int i = 0; i < av->nb_samples; ++i) for (int c = 0; c < a.channelCount; ++c) pcm.push_back(reinterpret_cast<const float*>(av->extended_data[c])[i]);
                 if (n == 1) qInfo() << "   first frame: nb_samples" << av->nb_samples << "fmt" << av->format << "datasize" << fr.data.size();
             }
-            qInfo() << " track" << t.number << "frames" << n << "tc" << first << "-" << last << "dropped" << rd.droppedFrames() << "pcm samples/ch" << pcm.size() / a.channelCount;
+            qInfo() << " track" << t.number << "frames" << n << "tc" << first << "-" << last << "dropped" << rd.droppedFrames() << "pcm samples/ch" << pcm.size() / static_cast<size_t>(a.channelCount);
             size_t skip = 4000;
             for (int c = 0; c < a.channelCount; ++c) {
                 QString line;
